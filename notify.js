@@ -207,7 +207,7 @@ export function setupPushButton(buttonId) {
 }
 
 // ★ 新着メッセージを、ルームのメンバー（送信者本人を除く）へ通知する。
-//   タイトル: 「送信者名 ＋ 改行 ＋ トークルーム名」
+//   タイトル: 「トークルーム名|送信者名」
 //   本文    : 通常は「メッセージ内容」、返信なら「〇〇に返信しました－メッセージ内容」
 //             （返信先が受信者本人なら「あなたに返信しました－メッセージ内容」）
 //   失敗してもメッセージ送信自体には影響させない（エラーは握りつぶす）
@@ -219,7 +219,7 @@ export async function sendMessageNotification(db, { roomId, roomTitle, memberIds
     const { appId, restApiKey } = await loadKeys(db);
     const content = (text || "").replace(/\s+/g, " ").trim().slice(0, 80) || "メッセージが届きました";
     const url = new URL(`talk.html?id=${encodeURIComponent(roomId)}`, location.href).href;
-    const title = `${senderName || "不明なユーザー"}\n${roomTitle || ""}`.trim();
+    const title = `${roomTitle || ""}|${senderName || "不明なユーザー"}`;
 
     // 宛先ごとの本文を決める（返信先の本人だけ「あなたに」になる）
     const groups = []; // { ids: [...], body: "..." }
