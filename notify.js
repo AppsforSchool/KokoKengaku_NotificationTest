@@ -111,6 +111,10 @@ export function setupPushButton(buttonId) {
   btn.dataset.pushBound = "1";
   const defaultText = btn.textContent;
 
+  // ★ .normal-button の display:block が .hidden より後に定義されていて .hidden が効かないため、
+  //   このボタンの表示/非表示は inline style で直接切り替える
+  const setVisible = (visible) => { btn.style.display = visible ? "" : "none"; };
+
   const say = async (msg) => {
     if (window.AppDialog) await window.AppDialog.alert(msg);
     else alert(msg);
@@ -118,14 +122,14 @@ export function setupPushButton(buttonId) {
 
   const updateVisibility = async () => {
     try {
-      if (!isPushEnabled()) { btn.classList.remove("hidden"); return; }
+      if (!isPushEnabled()) { setVisible(true); return; }
       if (initPromise) await initPromise;
       const sub = await getSubscription();
-      btn.classList.toggle("hidden", sub.optedIn);
+      setVisible(!sub.optedIn);
       if (!sub.optedIn) btn.textContent = "通知の登録をやり直す";
     } catch (e) {
       console.warn(e);
-      btn.classList.remove("hidden");
+      setVisible(true);
       btn.textContent = "通知の登録をやり直す";
     }
   };
@@ -142,6 +146,7 @@ export function setupPushButton(buttonId) {
     }
 
     btn.disabled = true;
+    let subscribed = false;
     try {
       // ① ユーザー操作の直後に、まずブラウザ標準の許可ダイアログを出す（iOSはこの順序が重要）
       if (Notification.permission !== "granted") {
@@ -174,18 +179,27 @@ export function setupPushButton(buttonId) {
       }), 15000, "購読の登録が終わりませんでした（optIn待ち）。");
 
       const sub = await getSubscription();
-      if (sub.optedIn) {
-        btn.classList.add("hidden");
-        await say("通知をオンにしました。");
-      } else {
-        await say("許可はされましたが、購読の登録が完了していません。\nもう一度ボタンを押してください。");
-      }
+      subscribed = sub.optedIn;
+
+      // ★ ダイアログを出す前にボタンの見た目を確定させる
+      btn.disabled = false;
+      setVisible(!subscribed);
+      btn.textContent = isPushEnabled() ? "通知の登録をやり直す" : defaultText;
+
+      await say(subscribed
+        ? "通知をオンにしました。"
+        : "許可はされましたが、購読の登録が完了していません。\nもう一度ボタンを押してください。");
     } catch (e) {
       console.error(e);
+      btn.disabled = false;
+      setVisible(true);
+      btn.textContent = isPushEnabled() ? "通知の登録をやり直す" : defaultText;
       await say("通知の設定に失敗しました。\n\n" + (e && e.message ? e.message : String(e)));
     } finally {
+      // 途中で return した場合（許可されなかった等）の後始末
       btn.disabled = false;
-      if (!btn.classList.contains("hidden")) {
+      if (!subscribed) {
+        setVisible(true);
         btn.textContent = isPushEnabled() ? "通知の登録をやり直す" : defaultText;
       }
     }
@@ -193,33 +207,50 @@ export function setupPushButton(buttonId) {
 }
 
 // ★ 新着メッセージを、ルームのメンバー（送信者本人を除く）へ通知する。
+//   タイトル: 「送信者名 ＋ 改行 ＋ トークルーム名」
+//   本文    : 通常は「メッセージ内容」、返信なら「〇〇に返信しました－メッセージ内容」
+//             （返信先が受信者本人なら「あなたに返信しました－メッセージ内容」）
 //   失敗してもメッセージ送信自体には影響させない（エラーは握りつぶす）
-export async function sendMessageNotification(db, { roomId, roomTitle, memberIds, senderId, senderName, text }) {
+export async function sendMessageNotification(db, { roomId, roomTitle, memberIds, senderId, senderName, text, replyToUserId, replyToName }) {
   try {
     const targets = (memberIds || []).filter((id) => id && id !== senderId);
     if (targets.length === 0) return;
 
     const { appId, restApiKey } = await loadKeys(db);
-    const body = (text || "").replace(/\s+/g, " ").trim().slice(0, 80) || "メッセージが届きました";
+    const content = (text || "").replace(/\s+/g, " ").trim().slice(0, 80) || "メッセージが届きました";
     const url = new URL(`talk.html?id=${encodeURIComponent(roomId)}`, location.href).href;
+    const title = `${senderName || "不明なユーザー"}\n${roomTitle || ""}`.trim();
 
-    const res = await fetch("https://api.onesignal.com/notifications", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json; charset=utf-8",
-        "Authorization": `Key ${restApiKey}`
-      },
-      body: JSON.stringify({
-        app_id: appId,
-        target_channel: "push",
-        include_aliases: { external_id: targets },
-        headings: { en: roomTitle || "新着メッセージ", ja: roomTitle || "新着メッセージ" },
-        contents: { en: `${senderName}: ${body}`, ja: `${senderName}: ${body}` },
-        web_push_topic: roomId,   // 同じルームの通知は最新1件にまとまる
-        url
-      })
-    });
-    if (!res.ok) console.warn("通知送信エラー:", res.status, await res.text());
+    // 宛先ごとの本文を決める（返信先の本人だけ「あなたに」になる）
+    const groups = []; // { ids: [...], body: "..." }
+    if (replyToUserId) {
+      const replied = targets.filter((id) => id === replyToUserId);
+      const others = targets.filter((id) => id !== replyToUserId);
+      if (replied.length) groups.push({ ids: replied, body: `あなたに返信しました－${content}` });
+      if (others.length) groups.push({ ids: others, body: `${replyToName || replyToUserId}に返信しました－${content}` });
+    } else {
+      groups.push({ ids: targets, body: content });
+    }
+
+    await Promise.all(groups.map(async (group) => {
+      const res = await fetch("https://api.onesignal.com/notifications", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Authorization": `Key ${restApiKey}`
+        },
+        body: JSON.stringify({
+          app_id: appId,
+          target_channel: "push",
+          include_aliases: { external_id: group.ids },
+          headings: { en: title, ja: title },
+          contents: { en: group.body, ja: group.body },
+          web_push_topic: roomId,   // 同じルームの通知は最新1件にまとまる
+          url
+        })
+      });
+      if (!res.ok) console.warn("通知送信エラー:", res.status, await res.text());
+    }));
   } catch (e) {
     console.warn("通知送信に失敗（CORSの可能性あり）:", e);
   }

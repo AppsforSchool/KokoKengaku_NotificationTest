@@ -1154,15 +1154,27 @@ function clearMessageDraft(id) {
 }
 
 // ★ 現在のトークルームのメンバー（自分以外）へ新着通知を送る。失敗しても送信処理には影響しない
-function notifyRoom(text) {
+function notifyRoom(text, replyTargetId = replyToId) {
   const titleEl = document.getElementById("talk-title");
+
+  // ★ 返信メッセージなら、返信先の投稿者（ユーザーID・表示名）を調べて通知文に使う
+  let replyToUserId = null;
+  let replyToName = "";
+  if (replyTargetId && messagesById[replyTargetId]) {
+    const target = messagesById[replyTargetId];
+    replyToUserId = target.userId;
+    replyToName = (getUserCache(target.userId) || {}).name || target.userId;
+  }
+
   return sendMessageNotification(db, {
     roomId: talkId,
     roomTitle: titleEl ? titleEl.textContent : "",
     memberIds: currentRoomMembers,
     senderId: myUserId,
     senderName: drawerUsername.textContent,
-    text
+    text,
+    replyToUserId,
+    replyToName
   });
 }
 
@@ -1187,7 +1199,7 @@ async function addMessage(talkId) {
     await db.collection("KokoKengaku").doc(talkId).update({
       lastUpdatedAt: firebase.firestore.FieldValue.serverTimestamp() // これを追加！
     });
-    notifyRoom(message); // ★ 新着通知（待たない）
+    notifyRoom(message, replyToSnapshot); // ★ 新着通知（待たない）
     cancelReply(); // ★ 送信成功後は返信状態を解除
     clearMessageDraft(talkId); // ★ 送信成功後は下書きをリセット
   }
