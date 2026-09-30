@@ -6,6 +6,7 @@ let keysCache = null;
 let initPromise = null;
 let initError = null;      // 直近の初期化エラー（iPhoneではConsoleが見られないので画面に出す用）
 let ctx = null;            // { db, userId }（再試行用）
+let initStep = "";         // 初期化のどの段階か（エラー表示用）
 
 async function loadKeys(db) {
   if (keysCache) return keysCache;
@@ -20,7 +21,7 @@ async function loadKeys(db) {
 function withTimeout(promise, ms, message) {
   return Promise.race([
     promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms))
+    new Promise((_, reject) => setTimeout(() => reject(new Error(typeof message === "function" ? message() : message)), ms))
   ]);
 }
 
@@ -30,6 +31,7 @@ export function initPush(db, userId) {
   if (initPromise) return initPromise;
   initError = null;
   initPromise = (async () => {
+    initStep = "Firestoreからキーを取得中";
     const { appId } = await loadKeys(db);
     // GitHub Pagesのサブパス公開でも動くよう、現在のページのフォルダをService Workerの範囲にする
     const base = location.pathname.replace(/[^/]*$/, "");
@@ -37,6 +39,7 @@ export function initPush(db, userId) {
     const sdkReady = new Promise((resolve, reject) => {
       window.OneSignalDeferred.push(async (OneSignal) => {
         try {
+          initStep = "OneSignalの初期化中（Service Workerの登録など）";
           await OneSignal.init({
             appId,
             serviceWorkerPath: base + "OneSignalSDKWorker.js",
@@ -44,14 +47,16 @@ export function initPush(db, userId) {
             allowLocalhostAsSecureOrigin: true,
             notifyButton: { enable: false }
           });
+          initStep = "ユーザーの紐づけ中";
           await OneSignal.login(userId);
+          initStep = "";
           resolve();
         } catch (e) {
           reject(e);
         }
       });
     });
-    await withTimeout(sdkReady, 20000, "OneSignalの読み込みがタイムアウトしました（SDKが読み込めていない可能性があります）。");
+    await withTimeout(sdkReady, 15000, () => "OneSignalの準備が終わりませんでした。\n止まった段階: " + (initStep || "SDKの読み込み待ち（SDKが読み込めていない可能性）"));
   })().catch((e) => {
     initError = e;
     initPromise = null;   // 次回押したときに再試行できるようにする
@@ -76,23 +81,55 @@ export async function logoutPush() {
   }
 }
 
+// ★ この端末が実際にOneSignalで購読済みかどうかを取得する
+function getSubscription() {
+  window.OneSignalDeferred = window.OneSignalDeferred || [];
+  return withTimeout(new Promise((resolve, reject) => {
+    window.OneSignalDeferred.push(async (OneSignal) => {
+      try {
+        resolve({
+          optedIn: !!OneSignal.User.PushSubscription.optedIn,
+          id: OneSignal.User.PushSubscription.id || ""
+        });
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }), 5000, "購読状態を取得できませんでした。");
+}
+
 // ★ 現在の通知許可状態（true/false）
 export function isPushEnabled() {
   return typeof Notification !== "undefined" && Notification.permission === "granted";
 }
 
 // ★ 「通知をオンにする」ボタンの初期化（talk.html / app.html 共通）
+//   ボタンは「実際に購読まで完了したとき」だけ隠す（許可済みでも登録が未完了なら再試行できるようにする）
 export function setupPushButton(buttonId) {
   const btn = document.getElementById(buttonId);
   if (!btn || btn.dataset.pushBound) return;
   btn.dataset.pushBound = "1";
+  const defaultText = btn.textContent;
 
   const say = async (msg) => {
     if (window.AppDialog) await window.AppDialog.alert(msg);
     else alert(msg);
   };
-  const refresh = () => btn.classList.toggle("hidden", isPushEnabled());
-  refresh();
+
+  const updateVisibility = async () => {
+    try {
+      if (!isPushEnabled()) { btn.classList.remove("hidden"); return; }
+      if (initPromise) await initPromise;
+      const sub = await getSubscription();
+      btn.classList.toggle("hidden", sub.optedIn);
+      if (!sub.optedIn) btn.textContent = "通知の登録をやり直す";
+    } catch (e) {
+      console.warn(e);
+      btn.classList.remove("hidden");
+      btn.textContent = "通知の登録をやり直す";
+    }
+  };
+  updateVisibility();
 
   btn.addEventListener("click", async () => {
     if (typeof Notification === "undefined") {
@@ -105,11 +142,10 @@ export function setupPushButton(buttonId) {
     }
 
     btn.disabled = true;
-    const originalText = btn.textContent;
-    btn.textContent = "設定中...";
     try {
       // ① ユーザー操作の直後に、まずブラウザ標準の許可ダイアログを出す（iOSはこの順序が重要）
       if (Notification.permission !== "granted") {
+        btn.textContent = "許可を確認中...";
         const permission = await Notification.requestPermission();
         if (permission !== "granted") {
           await say("通知が許可されませんでした。");
@@ -117,36 +153,41 @@ export function setupPushButton(buttonId) {
         }
       }
 
-      // ② OneSignal側の初期化を待ち、この端末を購読状態にする
+      // ② OneSignal側の初期化を待つ（前回失敗していれば再試行）
+      btn.textContent = "OneSignalを準備中...";
       if (!initPromise && ctx) initPush(ctx.db, ctx.userId);
       if (initPromise) await initPromise;
       if (initError) throw initError;
 
+      // ③ この端末を購読状態にする
+      btn.textContent = "購読を登録中...";
       window.OneSignalDeferred = window.OneSignalDeferred || [];
-      const result = await withTimeout(new Promise((resolve, reject) => {
+      await withTimeout(new Promise((resolve, reject) => {
         window.OneSignalDeferred.push(async (OneSignal) => {
           try {
             await OneSignal.User.PushSubscription.optIn();
-            resolve({
-              optedIn: OneSignal.User.PushSubscription.optedIn,
-              id: OneSignal.User.PushSubscription.id
-            });
+            resolve();
           } catch (e) {
             reject(e);
           }
         });
-      }), 15000, "購読の登録がタイムアウトしました。");
+      }), 15000, "購読の登録が終わりませんでした（optIn待ち）。");
 
-      refresh();
-      await say(result.optedIn
-        ? "通知をオンにしました。"
-        : "許可はされましたが、購読の登録が完了していません。少し待ってからもう一度お試しください。");
+      const sub = await getSubscription();
+      if (sub.optedIn) {
+        btn.classList.add("hidden");
+        await say("通知をオンにしました。");
+      } else {
+        await say("許可はされましたが、購読の登録が完了していません。\nもう一度ボタンを押してください。");
+      }
     } catch (e) {
       console.error(e);
       await say("通知の設定に失敗しました。\n\n" + (e && e.message ? e.message : String(e)));
     } finally {
       btn.disabled = false;
-      btn.textContent = originalText;
+      if (!btn.classList.contains("hidden")) {
+        btn.textContent = isPushEnabled() ? "通知の登録をやり直す" : defaultText;
+      }
     }
   });
 }
